@@ -85,6 +85,7 @@ import { escapeFormulaCell } from './lib/tsv-formula-escape.mjs';
 import { sectionKind } from './lib/pipeline-sections.mjs';
 import { canonicalJobKey, normalizeUrl, LANGUAGE_PARAMS, languageSubtag, promoteKnownFragmentIdentity } from './url-key.mjs';
 import { getCareerOpsRoot, getProfilePath, hasProfileOverride } from './path-resolver.mjs';
+import { withProviderContinuation, providerCoverage } from './provider-continuation.mjs';
 import { checkLivenessViaApi } from './liveness-api.mjs';
 import { robotsAllows } from './robots-check.mjs';
 import { resolveExperienceFilter, applyExperienceFilter } from './jd-years.mjs';
@@ -4919,6 +4920,7 @@ async function main() {
   let failedTargets = 0;
   const emptyTargets = [];
   const unverifiedZeroTargets = [];
+  const incompleteTargets = [];
 
   // Arm the failure-path row (#2643) now that the sweep is about to start and
   // every counter it reads is in scope. new_added is hardcoded 0 on a failed
@@ -5000,6 +5002,7 @@ async function main() {
     let sourceName = provider.id === 'local-parser' ? 'local-parser' : `${provider.id}-api`;
     const recordError = err => {
       failedTargets++;
+      if (err.coverage) incompleteTargets.push({ company: company.name, ...err.coverage });
       errors.push({
         company: company.name,
         error: err.message,
@@ -5009,8 +5012,11 @@ async function main() {
     };
     try {
       let jobs;
+      const fetchProvider = () => withProviderContinuation({
+        root: DATA_ROOT, providerId: provider.id, entry: company, enabled: !dryRun,
+      }, continuation => provider.fetch(company, { ...ctx, ...(continuation ? { continuation } : {}) }));
       try {
-        jobs = await provider.fetch(company, ctx);
+        jobs = await fetchProvider();
       } catch (parserErr) {
         if (provider.id !== 'local-parser') throw parserErr;
         const fallback = resolveProvider(company, providers, { skipIds: ['local-parser'] });
@@ -5018,7 +5024,7 @@ async function main() {
         provider = fallback.provider;
         sourceName = `${provider.id}-api`;
         ctx.idCache = idCaches.forProvider(provider.id);
-        jobs = await provider.fetch(company, ctx);
+        jobs = await fetchProvider();
         errors.push({
           company: company.name,
           error: `local parser failed, used API fallback: ${parserErr.message}`,
@@ -5027,6 +5033,8 @@ async function main() {
       if (!Array.isArray(jobs)) {
         throw new Error(`${provider.id}: fetch() did not return an array`);
       }
+      const coverage = providerCoverage(jobs, provider.id);
+      if (coverage) incompleteTargets.push({ company: company.name, ...coverage });
       totalFound += jobs.length;
       if (!company._isBoard && jobs.length === 0) {
         if (emptyTargetStatus(observation) === 'empty') emptyTargets.push(company.name);
@@ -5486,6 +5494,12 @@ async function main() {
   const summaryBoards = targets.filter(t => t._isBoard).length;
   console.log(`Companies scanned:     ${summaryCompanies}`);
   if (summaryBoards > 0) console.log(`Job boards scanned:    ${summaryBoards}`);
+  if (incompleteTargets.length) {
+    console.log(`Incomplete boards:     ${incompleteTargets.length} (candidate results are partial)`);
+    for (const item of incompleteTargets) {
+      console.log(`  • ${item.company}: ${item.reason}; ${item.fetched}${item.total == null ? '' : ` of ${item.total}`} jobs; ${item.resumable ? `next scan resumes page ${item.next_page}${item.retry_at ? ` after ${item.retry_at}` : ''}` : 'no automatic page continuation available'}`);
+    }
+  }
   console.log(`Total jobs found:      ${totalFound}`);
   if (config.title_filter || totalFilteredTitle > 0) {
     console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
@@ -5790,6 +5804,7 @@ async function main() {
       added_urls: verifiedOffers.map(offer => offer.url),
       errors: errors.map(({ company, error }) => ({ company, error })),
       unverified_zero: unverifiedZeroTargets,
+      incomplete: incompleteTargets,
       dry_run: dryRun,
     }, errors.length > 0 ? 2 : 0);
   }

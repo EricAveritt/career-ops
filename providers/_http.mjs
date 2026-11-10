@@ -22,7 +22,7 @@ import { normalizeUrl, aggregatorPostingId } from '../url-key.mjs';
  * added by the retry loop — the real request count, not the `retries + 1`
  * ceiling.
  *
- * @typedef {Error & { status?: number, body?: string, retryAfter?: (string | null), location?: (string | null), attempts?: number }} HttpError
+ * @typedef {Error & { status?: number, body?: string, retryAfter?: (string | null), retryAt?: number, retryDeferred?: boolean, retryBudgetExhausted?: boolean, location?: (string | null), attempts?: number }} HttpError
  */
 
 export { BROWSER_LIKE_USER_AGENT, MACOS_BROWSER_LIKE_USER_AGENT };
@@ -690,9 +690,9 @@ export function isRetryableError(err) {
  * Shared by every provider that retries a fetch (a16z-speedrun-talent.mjs,
  * workday.mjs, oraclecloud.mjs, each via its own `policy` override — see
  * RETRY_DEFAULTS above) so all of them get the same mature semantics —
- * exponential backoff, jitter, and a Retry-After that is honoured but
- * CLAMPED so a hostile or misconfigured `Retry-After: 86400` cannot stall a
- * sweep — instead of each one re-deriving them independently.
+ * exponential backoff and jitter. A Retry-After beyond the bounded waiting
+ * budget defers the request instead of retrying BEFORE the server permits it.
+ * The error retains retryAt so a resumable caller can schedule the next chunk.
  *
  * Deliberately does NOT decide what happens when retries are exhausted: it
  * rethrows, and the caller chooses. That policy genuinely differs per provider
@@ -726,6 +726,10 @@ async function withRetry(request, ctx, policy = {}) {
       // which would replace the real rejection with an unrelated TypeError
       // right here in the catch, before any caller sees it.
       if (err !== null && (typeof err === 'object' || typeof err === 'function')) err.attempts = attempt + 1;
+      const retryAfterMs = parseRetryAfterMs(err?.retryAfter);
+      if (retryAfterMs !== null && err !== null && typeof err === 'object') {
+        err.retryAt = Math.min(8_640_000_000_000_000, Date.now() + retryAfterMs);
+      }
       // A board whose watchdog has already fired must not keep retrying: that is
       // the 4-attempts-per-slice storm a timed-out Workday board left running in
       // the background (#5570). The abort is terminal, not a transient failure.
@@ -741,10 +745,22 @@ async function withRetry(request, ctx, policy = {}) {
       const jitterMs = Math.min(JITTER_MS, Math.max(0, maxDelayMs));
       const ceiling = Math.max(0, maxDelayMs - jitterMs);
       const backoff = Math.min(baseDelayMs * 2 ** attempt, ceiling);
-      const retryAfterMs = parseRetryAfterMs(err?.retryAfter);
-      const delayMs = retryAfterMs !== null
-        ? Math.min(retryAfterMs, maxDelayMs * 4)
-        : backoff + Math.random() * jitterMs;
+      const waitBudget = Math.min(60_000, maxDelayMs * 4);
+      if (retryAfterMs !== null && retryAfterMs > waitBudget) {
+        err.retryDeferred = true;
+        throw err;
+      }
+      // Header is a minimum, not a replacement for backoff: Retry-After: 0
+      // must not create an immediate retry storm. Jitter still spreads peers.
+      const jitter = Math.random() * jitterMs;
+      const delayMs = retryAfterMs === null ? backoff + jitter
+        : Math.min(waitBudget, Math.max(retryAfterMs, backoff) + jitter);
+      const boardNow = ctx?.continuation?.now?.() ?? Date.now();
+      if (Number.isFinite(ctx?.continuation?.deadlineAt) && boardNow + delayMs >= ctx.continuation.deadlineAt) {
+        err.retryBudgetExhausted = true;
+        err.retryAt = Math.max(err.retryAt ?? 0, boardNow + delayMs);
+        throw err;
+      }
       // Interruptible: if the board's watchdog fires during the backoff, stop
       // waiting and give up rather than sleeping out the delay and then issuing
       // a doomed attempt (#5570).

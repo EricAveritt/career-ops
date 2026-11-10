@@ -10,6 +10,9 @@
 // Workday only exposes a relative "postedOn" label ("Posted Today",
 // "Posted 5 Days Ago", "Posted 30+ Days Ago"); postedAt is derived from it
 // and omitted for the unbounded "30+ Days Ago" form.
+// Optional entry.workday.search_text sends a keyword query in EVERY CXS page
+// and facet slice. Absent/blank preserves the full-board searchText:'' default.
+// A keyword search covers that query's results, not the entire employer board.
 
 import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs';
 
@@ -828,7 +831,7 @@ export default {
    * origin/referer clears it without needing per-tenant config (same fix
    * as providers/glints.mjs's firewall).
    *
-   * @param {{ name?: string, api?: string, careers_url?: string, max_pages?: number }} entry
+   * @param {{ name?: string, api?: string, careers_url?: string, max_pages?: number, workday?: {search_text?: string} }} entry
    * @param {{ fetchJson: (url: string, opts?: object) => Promise<any>, sinceMs?: number, maxPages?: number, syntheticEntries?: boolean }} ctx
    * @returns {Promise<Array<{title: string, url: string, company: string, location: string, postedAt?: number}>>}
    */
@@ -848,7 +851,11 @@ export default {
         referer: `${ep.jobBase}/`,
       },
     };
-    const makeBody = (offset, appliedFacets) => JSON.stringify({ limit: PAGE_SIZE, offset, searchText: '', appliedFacets });
+    if (entry.workday?.search_text != null && typeof entry.workday.search_text !== 'string') {
+      throw new Error('workday: workday.search_text must be a string');
+    }
+    const searchText = entry.workday?.search_text?.trim() ?? '';
+    const makeBody = (offset, appliedFacets) => JSON.stringify({ limit: PAGE_SIZE, offset, searchText, appliedFacets });
     const sinceMs = typeof ctx?.sinceMs === 'number' ? ctx.sinceMs : null;
     const maxPages = resolveMaxPages(entry);
 
@@ -1289,6 +1296,7 @@ export default {
     // the parallel sweep, when the line is quiet — same array-tag pattern as
     // workdayNoDateSkip (no extra per-tenant logging here).
     if (stopReason === STOP_REASON.FETCH_ERROR) jobs.workdayTruncated = WORKDAY_TRUNCATED_REASON.TRANSIENT;
+    if (stopReason === STOP_REASON.CAP && !root.clamped) jobs.workdayTruncated = WORKDAY_TRUNCATED_REASON.STRUCTURAL;
     // A split that could not reach the whole board is the same kind of partial
     // result. Structural causes (slice/depth/facet/page budget exhausted) win
     // over a transient one in the mix — a board that hit MAX_SPLIT_SLICES

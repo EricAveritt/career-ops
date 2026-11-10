@@ -2,6 +2,7 @@
 /** @typedef {import('./_types.js').Provider} Provider */
 
 import { safeEncodeURIComponent } from './_safe-url.mjs';
+import { fetchJsonWithRetry } from './_http.mjs';
 
 // JibeApply provider — hits the /api/jobs endpoint on the same hostname.
 // Auto-detects from careers_url pattern `https://<slug>.jibeapply.com`.
@@ -49,6 +50,22 @@ function validateExplicitApi(apiUrl) {
   return u.protocol === 'https:' ? u.href : null;
 }
 
+// The API's posted_date is the publication date. Updated/modified timestamps
+// must never make an old opening look newly posted. Only explicit ISO dates
+// or timestamps with an offset are accepted; missing/invalid stays unknown.
+function postedDateMs(value) {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2}))?$/i);
+  if (!match) return undefined;
+  const [year, month, day] = match.slice(1, 4).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return undefined;
+  if (match[4] !== undefined && (Number(match[4]) > 23 || Number(match[5]) > 59 || Number(match[6] ?? 0) > 59)) return undefined;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 export function parseJibeapplyResponse(json, entry) {
   let origin = '';
   try { origin = new URL(entry.careers_url || '').origin; } catch { /* ignore */ }
@@ -72,12 +89,15 @@ export function parseJibeapplyResponse(json, entry) {
       // .filter(Boolean) removes the null).
       const encodedSlug = safeEncodeURIComponent(slug);
       if (encodedSlug === null) return null;
-      return {
+      const job = {
         title,
         url: `${origin}/jobs/${encodedSlug}`,
         company: String(d.hiring_organization || entry.name || '').trim(),
         location: d.full_location || [d.city, d.country].filter(Boolean).join(', '),
       };
+      const postedAt = postedDateMs(d.posted_date);
+      if (postedAt !== undefined) job.postedAt = postedAt;
+      return job;
     })
     .filter(Boolean);
 }
@@ -103,7 +123,7 @@ export default {
     const apiUrl = (typeof entry.api === 'string' && validateExplicitApi(entry.api))
       || toApiUrl(url);
     if (!apiUrl) throw new Error(`jibeapply: cannot derive API URL for ${entry.name}`);
-    const first = await ctx.fetchJson(apiUrl, { redirect: 'error' });
+    const first = await fetchJsonWithRetry(ctx, apiUrl, { redirect: 'error' });
     const total = first.totalCount ?? 0;
     // Use the actual number of items returned as page size — some implementations
     // set `count` to the total rather than the per-page count.
@@ -112,6 +132,8 @@ export default {
     // Set when the board is cut short (page cap or a failed page), so a caller can tell a
     // partial board from a complete one without reading stderr (the workdayTruncated convention).
     let truncated = false;
+    let stopReason = null;
+    let lastError = null;
 
     if (total > pageSize && pageSize > 0) {
       const maxPages = resolveMaxPages(entry);
@@ -126,10 +148,12 @@ export default {
         u2.searchParams.set('page', String(page));
         let json;
         try {
-          json = await ctx.fetchJson(u2.toString(), { redirect: 'error' });
+          json = await fetchJsonWithRetry(ctx, u2.toString(), { redirect: 'error' });
         } catch (err) {
           console.error(`⚠️  jibeapply: ${entry.name} page ${page} fetch failed — ${err.message} (returning ${allJobs.length} jobs fetched so far)`);
           truncated = true;
+          stopReason = err.status === 429 ? 'rate_limit' : err.status >= 500 ? 'server_error' : 'fetch_error';
+          lastError = err;
           break;
         }
         allJobs.push(...(json.jobs ?? []));
@@ -139,8 +163,9 @@ export default {
       // but a tenant that actually exceeds it needs to be surfaced —
       // otherwise the user has no way to notice postings are missing from
       // their scan.
-      if (Math.ceil(total / pageSize) > maxPages) {
+      if (Math.ceil(total / pageSize) > maxPages && !stopReason) {
         truncated = true;
+        stopReason ??= 'page_cap';
         console.error(
           `⚠️  jibeapply: ${entry.name} has more postings than max_pages allows ` +
           `(fetched ${allJobs.length} of ${total}) — ` +
@@ -150,7 +175,14 @@ export default {
     }
 
     const result = parseJibeapplyResponse({ jobs: allJobs }, entry);
-    if (truncated) /** @type {any} */ (result).jibeapplyTruncated = true;
+    if (truncated) {
+      /** @type {any} */ (result).jibeapplyTruncated = true;
+      Object.defineProperty(result, 'coverage', { value: {
+        complete: false, provider: 'jibeapply', reason: stopReason, fetched: result.length,
+        total, resumable: false,
+        ...(lastError?.retryAt ? { retry_at: new Date(lastError.retryAt).toISOString() } : {}),
+      } });
+    }
     return result;
   },
 };

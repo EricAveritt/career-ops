@@ -263,8 +263,9 @@ try {
     const jobs = await paylocity.fetch({ name: 'ExampleCo', careers_url: BOARD }, ctx);
     if (jobs.length === 3 && calls.length === 3) pass('paylocity.fetch() retries a 429 and returns the board once it answers');
     else fail(`paylocity.fetch() after 429s: ${jobs.length} jobs, ${calls.length} calls`);
-    if (sleeps[0] === 5_000) pass('paylocity.fetch() waits for the Retry-After a 429 carries');
-    else fail(`paylocity.fetch() first wait was ${sleeps[0]} ms, expected 5000`);
+    // Retry-After is a minimum; the shared retry helper adds <250ms of jitter.
+    if (sleeps[0] >= 5_000 && sleeps[0] < 5_250) pass('paylocity.fetch() honours Retry-After minimum with bounded jitter');
+    else fail(`paylocity.fetch() first wait was ${sleeps[0]} ms, expected at least 5000 and less than 5250`);
     if (calls.every(o => o?.redirect === 'manual')) pass('paylocity.fetch() passes redirect:manual on every attempt');
     else fail(`paylocity.fetch() retry redirect opts were ${JSON.stringify(calls.map(o => o?.redirect))}`);
   }

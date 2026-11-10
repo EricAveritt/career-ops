@@ -321,11 +321,11 @@ try {
     const out = await jobvite.fetch({ name: 'Tyler Technologies', company_eid: 'q6NaVfwI' }, ctx);
     eq('fetch() retries the feed after a 429', calls, 2);
     eq('fetch() returns the jobs the retry recovered', out.length, 3);
-    // Honoured as advertised, not replaced by the exponential backoff. The
-    // shared clamp is maxDelayMs * 4 = 60s under this provider's policy, so a
-    // 30s header passes through intact rather than being truncated into another
-    // guaranteed 429.
-    eq('fetch() honours Retry-After exactly', slept[0], 30_000);
+    // The header is the minimum wait, with less than 250ms of shared jitter.
+    // This stays below the provider's 60s wait budget and never retries before
+    // the 30s header permits it.
+    eq('fetch() honours Retry-After minimum with bounded jitter',
+      slept[0] >= 30_000 && slept[0] < 30_250, true);
   }
 
   // A 4xx that is not 429 is the server rejecting the request itself; retrying

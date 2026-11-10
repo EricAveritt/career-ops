@@ -43,6 +43,7 @@
 
 import { decodeEntities } from './_html-entities.mjs';
 import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs';
+import { openProviderWalk } from '../provider-continuation.mjs';
 
 // `oraclecloud(?:[1-9][0-9]?)?` = oraclecloud.com plus oraclecloud1.com …
 // oraclecloud99.com. No leading zero, at most two digits — a bounded family,
@@ -50,7 +51,7 @@ import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs'
 const ORACLE_HOST_RE = /^[a-z0-9-]+\.fa\.(?:[a-z0-9-]+\.)?(?:ocs\.)?oraclecloud(?:[1-9][0-9]?)?\.com$/i;
 
 const PAGE_SIZE = 200;
-const MAX_PAGES = 25;             // safety cap (~5000 jobs); hard ceiling like workday
+const MAX_PAGES = 25;             // bounded chunk (~5000 jobs); configured scans persist the next offset
 const RETRY_POLICY = { retries: 3 };
 const INTER_PAGE_DELAY_MS = 250;  // WAF-aware spacing between same-host pages
 
@@ -231,25 +232,40 @@ export default {
       ? Math.min(entry.max_pages, MAX_PAGES)
       : MAX_PAGES;
 
-    const all = [];
-    let total = null;
-    for (let page = 0; page < maxPages; page++) {
+    const walk = openProviderWalk(ctx, 'oraclecloud');
+    const all = walk.jobs;
+    let total = walk.meta.total ?? null;
+    if (walk.deferred()) return all;
+    const ctxCap = Number.isInteger(ctx?.maxPages) && ctx.maxPages > 0 ? ctx.maxPages : Infinity;
+    let complete = false;
+    for (let chunkPage = 0; chunkPage < Math.min(maxPages, ctxCap); chunkPage++) {
+      if (walk.budgetExpired()) return walk.partial('time_budget');
+      const page = walk.page;
       const offset = page * PAGE_SIZE;
       const apiUrl = buildApiUrl(site, offset, PAGE_SIZE);
       assertOracleUrl(apiUrl); // SSRF guard before every fetch
       if (page > 0) await sleep(INTER_PAGE_DELAY_MS, ctx);
+      if (walk.budgetExpired()) return walk.partial('time_budget');
 
-      const json = await fetchJsonWithRetry(ctx, apiUrl, {
-        redirect: 'error',
-        headers: { 'User-Agent': BROWSER_LIKE_USER_AGENT, Accept: 'application/json' },
-      }, RETRY_POLICY);
+      let json;
+      try {
+        json = await fetchJsonWithRetry(ctx, apiUrl, {
+          redirect: 'error',
+          headers: { 'User-Agent': BROWSER_LIKE_USER_AGENT, Accept: 'application/json' },
+        }, RETRY_POLICY);
+      } catch (error) {
+        walk.meta = { total };
+        console.error(`⚠️  oraclecloud: ${entry.name} paused at offset=${offset}: ${error.message}; board remains partial`);
+        return walk.failure(error);
+      }
 
       const parsed = parseOracleResponse(json, site, entry.name);
-      all.push(...parsed);
 
       const item = Array.isArray(json?.items) ? json.items[0] : null;
       if (total === null && item && typeof item.TotalJobsCount === 'number') total = item.TotalJobsCount;
       const listLen = item && Array.isArray(item.requisitionList) ? item.requisitionList.length : 0;
+      const fresh = walk.add(parsed, page + 1, { total });
+      if (listLen > 0 && fresh === 0) return walk.partial('pagination_stalled', undefined, false);
 
       // Stop conditions. NOTE: `hasMore` is unreliable on some tenants (e.g.
       // JPMC returns hasMore:false on EVERY page even with 7000+ jobs), so it's
@@ -263,11 +279,14 @@ export default {
       // than the number requested … even if not at the end of the collection"
       // (Google AIP-158). So a short page only ends the walk when the tenant
       // reports no total to check it against.
-      if (listLen === 0) break;
+      if (listLen === 0) { complete = true; break; }
       if (total !== null) {
-        if (offset + PAGE_SIZE >= total) break;
-      } else if (listLen < PAGE_SIZE) break;
+        if (offset + PAGE_SIZE >= total) { complete = true; break; }
+      } else if (listLen < PAGE_SIZE) { complete = true; break; }
     }
-    return all;
+    if (complete) return walk.complete();
+    if (ctxCap < maxPages) return all;
+    console.error(`⚠️  oraclecloud: ${entry.name} partial at max_pages=${maxPages} (${all.length}${total == null ? '' : ` of ${total}`} jobs); ${ctx.continuation ? 'next scan continues from the saved page' : 'later pages were not read'}`);
+    return walk.partial('page_cap');
   },
 };

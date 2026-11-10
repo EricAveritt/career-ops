@@ -241,22 +241,23 @@ try {
   try {
     fetchedFlaky = await jibeapply.fetch(entry, {
       transport: 'http',
+      sleep: async () => {},
       fetchText: async () => { throw new Error('fetchText not expected'); },
       fetchJson: async (url) => {
         flakyRequests++;
         const u = new URL(url);
         const page = parseInt(u.searchParams.get('page') || '1', 10);
-        if (page === 3) throw new Error('HTTP 503');
+        if (page === 3) throw Object.assign(new Error('HTTP 503'), { status: 503 });
         return { totalCount: 40, count: 10, jobs: Array.from({ length: 10 }, (_, i) => ({ title: `Job p${page}-${i}`, slug: `job-p${page}-${i}` })) };
       },
     });
   } finally {
     console.error = originalConsoleError;
   }
-  if (flakyRequests === 3 && fetchedFlaky.length === 20) {
-    pass('jibeapply.fetch() returns partial results when a later page fails');
+  if (flakyRequests === 5 && fetchedFlaky.length === 20 && fetchedFlaky.coverage?.reason === 'server_error') {
+    pass('jibeapply.fetch() retries a later 503 within bounds, then returns explicit partial results');
   } else {
-    fail(`jibeapply fetch partial failure: requests=${flakyRequests}, total=${fetchedFlaky.length} (expected 3/20)`);
+    fail(`jibeapply fetch partial failure: requests=${flakyRequests}, total=${fetchedFlaky.length} (expected 5/20 with server_error)`);
   }
   if (jibeFlakyWarnings.some(w => /page \d+ fetch failed/.test(w))) {
     pass('jibeapply.fetch() warns (console.error) when a page fetch fails mid-pagination');

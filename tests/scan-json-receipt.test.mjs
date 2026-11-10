@@ -122,6 +122,7 @@ test('--json emits exactly one clean successful receipt', () => {
       added_urls: [],
       errors: [],
       unverified_zero: [],
+      incomplete: [],
       dry_run: true,
     });
     assert.match(result.stderr, /Portal Scan/);
@@ -167,4 +168,59 @@ test('a receipt larger than the pipe buffer drains completely', () => {
   const receipt = JSON.parse(result.stdout);
   assert.equal(receipt.added_urls.length, 20000);
   assert.ok(Buffer.byteLength(result.stdout) > 65536);
+});
+
+test('ordinary JSON scans automatically continue page chunks in the configured data root', () => {
+  const root = workspace('tracked_companies:\n  - name: Synthetic Large Board\n    careers_url: https://synthetic.eightfold.ai/careers\n    max_pages: 1\n');
+  const preload = join(root, 'transport.mjs');
+  const calls = join(root, 'calls.jsonl');
+  writeFileSync(preload, `
+    import { appendFileSync } from 'node:fs';
+    globalThis.fetch = async (url) => {
+      const start = Number(new URL(url).searchParams.get('start'));
+      appendFileSync(${JSON.stringify(calls)}, JSON.stringify(start) + '\\n');
+      const positions = Array.from({length: Math.max(0, Math.min(10, 21-start))}, (_,i) => ({id:String(start+i),name:'Engineer '+(start+i),location:'United States'}));
+      return new Response(JSON.stringify({positions,count:21}), {headers:{'content-type':'application/json'}});
+    };
+  `);
+  const run = dry => spawnSync(process.execPath, ['--import', preload, SCAN, '--json', ...(dry ? ['--dry-run'] : [])], {
+    cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, CAREER_OPS_ROOT: root, CAREER_OPS_PROFILE: join(root, 'config/profile.yml'), CAREER_OPS_PORTALS: join(root, 'portals.yml'), CAREER_OPS_TRACKER: '', CAREER_OPS_PIPELINE: join(root, 'data/pipeline.md'), CAREER_OPS_SCAN_HISTORY: join(root, 'data/scan-history.tsv') },
+  });
+  try {
+    const first = run(false);
+    assert.equal(first.status, 0, describeSpawn(first));
+    const receipt = JSON.parse(first.stdout);
+    assert.equal(receipt.incomplete[0].reason, 'page_cap');
+    assert.equal(receipt.incomplete[0].resumable, true);
+    assert.equal(receipt.incomplete[0].next_page, 1);
+    const second = run(false);
+    assert.equal(second.status, 0, describeSpawn(second));
+    assert.equal(JSON.parse(second.stdout).incomplete[0].next_page, 2);
+    const third = run(false);
+    assert.equal(third.status, 0, describeSpawn(third));
+    assert.deepEqual(JSON.parse(third.stdout).incomplete, []);
+    assert.deepEqual(readFileSync(calls, 'utf8').trim().split('\n').map(Number), [0, 10, 20]);
+    assert.deepEqual(readdirSync(join(root, 'data/cache/provider-continuations')), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a first-page long Retry-After is an explicit resumable partial error, not an empty complete board', () => {
+  const root = workspace('tracked_companies:\n  - name: Synthetic Busy Board\n    careers_url: https://synthetic.eightfold.ai/careers\n    max_pages: 1\n');
+  const preload = join(root, 'transport.mjs');
+  writeFileSync(preload, `globalThis.fetch = async () => new Response('busy', {status:429,headers:{'retry-after':'120'}});`);
+  try {
+    const result = spawnSync(process.execPath, ['--import', preload, SCAN, '--json'], {
+      cwd: root, encoding: 'utf8',
+      env: { ...process.env, CAREER_OPS_ROOT: root, CAREER_OPS_PROFILE: join(root, 'config/profile.yml'), CAREER_OPS_PORTALS: join(root, 'portals.yml'), CAREER_OPS_TRACKER: '', CAREER_OPS_PIPELINE: join(root, 'data/pipeline.md'), CAREER_OPS_SCAN_HISTORY: join(root, 'data/scan-history.tsv') },
+    });
+    assert.equal(result.status, 2, describeSpawn(result));
+    const receipt = JSON.parse(result.stdout);
+    assert.equal(receipt.incomplete[0].reason, 'retry_after');
+    assert.equal(receipt.incomplete[0].status, 429);
+    assert.equal(receipt.incomplete[0].resumable, true);
+    assert.equal(receipt.incomplete[0].next_page, 0);
+    assert.ok(Date.parse(receipt.incomplete[0].retry_at) > Date.now());
+    assert.equal(receipt.errors.length, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -55,6 +55,7 @@
 
 import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs';
 import { coerceId } from './_ids.mjs';
+import { openProviderWalk } from '../provider-continuation.mjs';
 
 const EIGHTFOLD_HOST_RE = /^[a-z0-9-]+\.eightfold\.ai$/i;
 // A bare DNS name with at least two labels and an alphabetic TLD. That shape
@@ -408,20 +409,35 @@ export default {
     // A probe's ctx.maxPages below the entry's own cap is the probe's budget,
     // not a max_pages cut: such a stop is neither warned about nor tagged.
     const probeLimited = maxPages < resolveMaxPages(entry);
-    const all = [];
+    const walk = openProviderWalk(ctx, 'eightfold');
+    const all = walk.jobs;
     /** @type {number|null} */
-    let total = null;
+    let total = walk.meta.total ?? null;
     // Which API this tenant serves, decided once per fetch and reused for every
     // page: 'v2' unless its FIRST page answers 403, then 'pcsx' if the PCSX
     // endpoint answers with a well-formed page. A 403 after v2 has served pages
     // is not a migration signal, and switching mid-walk would splice two
     // endpoints' orderings together (duplicated or skipped postings).
-    let api = 'v2';
-    let rateLimited = false;
+    let api = walk.meta.api ?? 'v2';
+    if (!['v2', 'pcsx'].includes(api)) throw new Error('eightfold: invalid checkpoint API');
+    if (walk.deferred()) {
+      all.eightfoldTruncated = true;
+      return all;
+    }
+    let complete = false;
 
-    for (let page = 0; page < maxPages; page++) {
+    for (let chunkPage = 0; chunkPage < maxPages && walk.page < MAX_PAGES_CAP; chunkPage++) {
+      if (walk.budgetExpired()) {
+        all.eightfoldTruncated = true;
+        return walk.partial('time_budget');
+      }
+      const page = walk.page;
       const start = page * PAGE_SIZE;
       if (page > 0) await sleep(api === 'pcsx' ? PCSX_INTER_PAGE_DELAY_MS : INTER_PAGE_DELAY_MS, ctx);
+      if (walk.budgetExpired()) {
+        all.eightfoldTruncated = true;
+        return walk.partial('time_budget');
+      }
 
       /** One request on whichever API this tenant is on. */
       const request = async (/** @type {string} */ which) => {
@@ -464,7 +480,8 @@ export default {
             // its own problem, and reporting the v2 403 in its place would read
             // as a deterministic block when the tenant is only busy or down.
             if ([403, 404, 410].includes(/** @type {any} */ (probeErr)?.status)) throw err;
-            throw probeErr;
+            walk.meta = { api, total };
+            return walk.failure(probeErr);
           }
           const page0 = normalizePcsxPage(pcsxJson);
           if (!page0) {
@@ -477,14 +494,12 @@ export default {
           }
           api = 'pcsx';
           json = { positions: page0.positions, ...(page0.count === undefined ? {} : { count: page0.count }) };
-        } else if (status === 429 && all.length > 0) {
-          // Large PCSX tenants rate-limit a sustained walk (measured: Microsoft
-          // 429s after ~20 pages at 1 req/s even with backoff). Keep the pages
-          // already collected and say the board is partial — never silently.
-          rateLimited = true;
-          break;
         } else {
-          throw err;
+          walk.meta = { api, total };
+          const partial = walk.failure(err);
+          partial.eightfoldTruncated = true;
+          console.error(`⚠️  eightfold: ${entry.name} paused at start=${start} after ${err.attempts ?? 1} attempt(s): ${err.message}; board remains partial`);
+          return partial;
         }
       }
 
@@ -498,11 +513,14 @@ export default {
         json = { positions: normalized.positions, ...(normalized.count === undefined ? {} : { count: normalized.count }) };
       }
 
-      all.push(...parseEightfoldResponse(json, tenant, entry.name));
-
       const positions = Array.isArray(json?.positions) ? json.positions : [];
       if (total === null && typeof json?.count === 'number' && Number.isFinite(json.count)) {
         total = json.count;
+      }
+      const fresh = walk.add(parseEightfoldResponse(json, tenant, entry.name), page + 1, { api, total });
+      if (positions.length > 0 && fresh === 0) {
+        all.eightfoldTruncated = true;
+        return walk.partial('pagination_stalled', undefined, false);
       }
 
       // Stop conditions, in the order they can be trusted:
@@ -510,24 +528,17 @@ export default {
       //   - once we have paged past `count` there is nothing left to ask for.
       // `count` alone is not enough: it is the pre-filter total on some
       // tenants, so a short page has to win.
-      if (positions.length === 0 || positions.length < PAGE_SIZE) break;
-      if (total !== null && start + PAGE_SIZE >= total) break;
+      if (positions.length === 0 || positions.length < PAGE_SIZE) { complete = true; break; }
+      if (total !== null && start + PAGE_SIZE >= total) { complete = true; break; }
     }
 
-    if (rateLimited) {
-      console.error(`⚠️  eightfold: ${entry.name} stopped early on HTTP 429 (${all.length}${total === null ? '' : ` of ${total}`} jobs) — the board is partial, not empty`);
-      // Tagged on the array, as workday.mjs (workdayTruncated) and
-      // adp-workforcenow.mjs (adpTruncated) do, so a caller can tell this
-      // board from a complete one without reading stderr.
-      /** @type {any} */ (all).eightfoldTruncated = true;
-    } else if (!probeLimited && total !== null && all.length < total && maxPages * PAGE_SIZE < total) {
-      console.error(`⚠️  eightfold: ${entry.name} truncated at max_pages=${maxPages} (${all.length} of ${total} jobs) — raise max_pages on this entry for more`);
-      // Same tag as the 429 branch above: the page cap cuts a board short just
-      // as a rate limit does (2,000 of 2,083 on a real tenant), and a caller
-      // that cannot see the stderr line must still be able to tell.
-      /** @type {any} */ (all).eightfoldTruncated = true;
+    if (complete) return walk.complete();
+    if (!probeLimited) {
+      const hardLimit = walk.page >= MAX_PAGES_CAP;
+      console.error(`⚠️  eightfold: ${entry.name} partial at max_pages=${maxPages} (${all.length}${total === null ? '' : ` of ${total}`} jobs); ${ctx.continuation && !hardLimit ? 'next scan continues from the saved page' : 'later pages were not read; raise max_pages only after checking the board limit'}`);
+      all.eightfoldTruncated = true;
+      return walk.partial(hardLimit ? 'safety_limit' : 'page_cap', undefined, !hardLimit);
     }
-
     return all;
   },
 };

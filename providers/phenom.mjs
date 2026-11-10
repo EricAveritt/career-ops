@@ -186,6 +186,7 @@ export default {
     // fresh rows on its own, and a fetch failure already keeps whatever was
     // collected without needing a second warning.
     let stopReason = 'complete';
+    let lastError = null;
     let page = 0;
     let anyPageSucceeded = false;
     for (; page < pagesToFetch; page++) {
@@ -238,6 +239,7 @@ export default {
         const jobsSummary = `${jobs.length}${total !== null ? ` of ${total}` : ''} jobs`;
         console.error(`⚠️  phenom: ${entry.name} truncated at page ${page + 1} of ${maxPages} (${jobsSummary}): ${err.message}`);
         stopReason = 'fetch-error';
+        lastError = err;
         break;
       }
       anyPageSucceeded = true;
@@ -269,7 +271,15 @@ export default {
 
     // A page cap or a failed page leaves the board partial; tag it (the workdayTruncated convention)
     // so a caller can tell without reading stderr.
-    if (stopReason === 'cap' || stopReason === 'fetch-error') /** @type {any} */ (jobs).phenomTruncated = true;
+    if (stopReason === 'cap' || stopReason === 'fetch-error') {
+      /** @type {any} */ (jobs).phenomTruncated = true;
+      Object.defineProperty(jobs, 'coverage', { value: {
+        complete: false, provider: 'phenom', reason: stopReason === 'cap' ? 'page_cap'
+          : lastError?.status === 429 ? 'rate_limit' : lastError?.status >= 500 ? 'server_error' : 'fetch_error',
+        fetched: jobs.length, total, resumable: false,
+        ...(lastError?.retryAt ? { retry_at: new Date(lastError.retryAt).toISOString() } : {}),
+      } });
+    }
 
     return jobs;
   },

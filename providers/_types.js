@@ -227,6 +227,10 @@
  *                              in scan.mjs and scan-ats-full.mjs runs, absent elsewhere
  *                              (verify-portals, tests), so a provider must work without it.
  *                              Values are stored as JSON.
+ * @property {{read: () => any, write: (state: any) => void, clear: () => void, now: () => number, deadlineAt: number}} [continuation]
+ *                              Optional board-scoped pagination checkpoint. Configured non-dry
+ *                              scans supply it to supported providers; probes/imports do not.
+ *                              Providers preserve their API/page budgets and return coverage metadata.
  */
 
 /**

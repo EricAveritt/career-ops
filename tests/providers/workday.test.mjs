@@ -786,28 +786,28 @@ try {
   } else {
     fail(`workday 429 retry: attempts=${retryAttempts}, jobs=${JSON.stringify(retryJobs)}`);
   }
-  if (retrySleepCalls[0] === 1000) {
+  if (retrySleepCalls[0] >= 1000 && retrySleepCalls[0] < 1250) {
     pass('workday.fetch() honors Retry-After header for backoff delay');
   } else {
-    fail(`workday retry-after: expected first backoff delay 1000ms, got ${JSON.stringify(retrySleepCalls)}`);
+    fail(`workday retry-after: expected 1000–1250ms with jitter, got ${JSON.stringify(retrySleepCalls)}`);
   }
 
   // fetch() retry — a hostile or misconfigured Retry-After (e.g. 86400s = a
-  // full day) must not be honored verbatim: it's clamped to
-  // RETRY_MAX_DELAY_MS * 4 (32s) so a single bad header can't stall a
-  // tenant's fetch indefinitely, defeating the point of a bounded backoff.
+  // full day) must not stall the scan OR cause an early request: defer it and
+  // preserve the server deadline rather than shortening its cooling-off period.
   let hostileRetrySleepCalls = [];
   let hostileRetryAttempts = 0;
   const hostileRetryEntry = { name: 'HostileRetryCo', careers_url: 'https://hostileretryco.wd5.myworkdayjobs.com/careers' };
-  await workday.fetch(hostileRetryEntry, mkWorkdayCtx(async () => {
+  let hostileRetryError;
+  try { await workday.fetch(hostileRetryEntry, mkWorkdayCtx(async () => {
     hostileRetryAttempts++;
     if (hostileRetryAttempts === 1) { const err = new Error('HTTP 429'); err.status = 429; err.retryAfter = '86400'; throw err; }
     return { total: 0, jobPostings: [] };
-  }, { sleep: async (ms) => { hostileRetrySleepCalls.push(ms); } }));
-  if (hostileRetrySleepCalls[0] === 32_000) {
-    pass('workday.fetch() clamps an oversized Retry-After to RETRY_MAX_DELAY_MS * 4');
+  }, { sleep: async (ms) => { hostileRetrySleepCalls.push(ms); } })); } catch (error) { hostileRetryError = error; }
+  if (hostileRetryAttempts === 1 && hostileRetrySleepCalls.length === 0 && hostileRetryError?.retryDeferred && hostileRetryError.retryAt > Date.now()) {
+    pass('workday.fetch() defers an oversized Retry-After without retrying early or blocking the sweep');
   } else {
-    fail(`workday retry-after clamp: expected 32000ms, got ${JSON.stringify(hostileRetrySleepCalls)}`);
+    fail(`workday retry-after deferral: attempts=${hostileRetryAttempts}, waits=${JSON.stringify(hostileRetrySleepCalls)}`);
   }
 
   // fetch() retry — a non-retryable 4xx (e.g. malformed request) breaks
